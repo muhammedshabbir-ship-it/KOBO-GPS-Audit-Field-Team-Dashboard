@@ -29,6 +29,7 @@ BASE_DIR = Path(__file__).parent
 MASTER_PATH = BASE_DIR / "master_kobo_file.xlsx"
 KOBO_SHEET = "KOBO RD"
 TZ = "Asia/Karachi"
+BOT_PREFIX = "BOT"   # Store IDs starting with this belong to the BOT panel; all others are SNAPP
 
 OK_M, REVIEW_M = 50, 150
 S_OK, S_REV, S_RED, S_NA = "OK (<50m)", "Review (50-150m)", "Mismatch (>150m)", "No master / bad GPS"
@@ -192,6 +193,8 @@ def haversine_m(lat1, lon1, lat2, lon2):
 def process(kobo: pd.DataFrame, master: pd.DataFrame) -> pd.DataFrame:
     d = kobo.rename(columns={**KEY_COLS, **EXTRA_COLS}).copy()
     d["Store ID"] = d["Store ID"].astype(str).str.strip().str.upper()
+    # PANEL: Store ID starting with BOT -> BOT panel, everything else -> SNAPP panel
+    d["Panel"] = np.where(d["Store ID"].str.startswith(BOT_PREFIX), "BOT", "SNAPP")
     d = d.merge(master, on="Store ID", how="left")
 
     for c in ["Lat", "Long", "Master Lat", "Master Long", "Start Lat", "Start Long", "GPS Accuracy (m)"]:
@@ -323,17 +326,23 @@ with st.spinner("Reading files… (a large .xlsb can take a minute the first tim
 # FILTERS (top)
 # ----------------------------------------------------------------------------
 st.markdown('<div class="filterbox">', unsafe_allow_html=True)
+panel = st.radio("Panel", ["SNAPP", "BOT", "All"], horizontal=True,
+                 help="BOT = Store ID starts with BOT. SNAPP = all other Store IDs. All = both panels together.")
+base = data if panel == "All" else data[data["Panel"] == panel]
+if base.empty:
+    st.warning(f"No {panel} stores in this file.")
+    st.stop()
 f1, f2, f3, f4, f5, f6 = st.columns([1.1, 1.3, 1, 1.3, 1.2, 1.3])
-city = f1.multiselect("City", sorted(data["City"].dropna().unique()))
-aud = f2.multiselect("Auditor", sorted(data["Auditor"].dropna().unique()))
-chan = f3.multiselect("Channel", sorted(data["Channel"].dropna().unique()))
-dmin, dmax = data["Date"].min().date(), data["Date"].max().date()
+city = f1.multiselect("City", sorted(base["City"].dropna().unique()))
+aud = f2.multiselect("Auditor", sorted(base["Auditor"].dropna().unique()))
+chan = f3.multiselect("Channel", sorted(base["Channel"].dropna().unique()))
+dmin, dmax = base["Date"].min().date(), base["Date"].max().date()
 drange = f4.date_input("Date range", (dmin, dmax), min_value=dmin, max_value=dmax)
 gstat = f5.multiselect("GPS status", ORDER)
-dev = f6.multiselect("Device", sorted(data["Device"].unique()))
+dev = f6.multiselect("Device", sorted(base["Device"].unique()))
 st.markdown("</div>", unsafe_allow_html=True)
 
-f = data.copy()
+f = base.copy()
 if city: f = f[f["City"].isin(city)]
 if aud: f = f[f["Auditor"].isin(aud)]
 if chan: f = f[f["Channel"].isin(chan)]
@@ -352,7 +361,7 @@ n = len(f)
 cnt = f["GPS Status"].value_counts()
 pct = lambda k: cnt.get(k, 0) / n * 100
 k = st.columns(8)
-kpi(k[0], "Total Visits", f"{n:,}", f"{f['Store ID'].nunique():,} unique stores")
+kpi(k[0], f"Total Visits · {panel}", f"{n:,}", f"{f['Store ID'].nunique():,} unique stores")
 kpi(k[1], "Auditors", f["Auditor"].nunique(), f"{f['Device ID'].nunique()} devices")
 kpi(k[2], "GPS OK", f"{cnt.get(S_OK, 0):,}", f"{pct(S_OK):.1f}% · < 50 m", COLORS[S_OK])
 kpi(k[3], "GPS Review", f"{cnt.get(S_REV, 0):,}", f"{pct(S_REV):.1f}% · 50–150 m", COLORS[S_REV])
@@ -409,6 +418,17 @@ with tabs[0]:
         show_fig(px.bar(t.melt(id_vars="Channel", value_vars=ORDER, var_name="GPS Status", value_name="Visits"),
                         x="Channel", y="Visits", color="GPS Status", color_discrete_map=COLORS,
                         title="Channel-wise visits & GPS result"), "ov_chan")
+
+    pc = f.groupby(["City", "Panel"]).agg(Visits=("Store ID", "size"), Stores=("Store ID", "nunique")).reset_index()
+    c5, c6 = st.columns([2, 1])
+    with c5:
+        show_fig(px.bar(pc, x="City", y="Visits", color="Panel", barmode="group",
+                        color_discrete_map={"SNAPP": "#38bdf8", "BOT": "#facc15"},
+                        title=f"Panel-wise visits by city ({panel})"), "ov_panel")
+    with c6:
+        st.markdown("#### City-wise table")
+        pt = status_table("City")[["City", "Total", "% OK", "% Review", "% Mismatch"]]
+        show_df(pt, hide_index=True)
 
 # ----------------------------------------------------------------------------
 # TAB 2 - GPS COMPARE
@@ -660,7 +680,7 @@ with tabs[7]:
     done = f[f["Shop Status"] == "Completed Interview"]
 
     lines = [
-        f"### Fieldwork overview",
+        f"### Fieldwork overview ({panel} panel)",
         f"- **{n:,} visits** covering **{f['Store ID'].nunique():,} stores** in **{f['City'].nunique()} cities** by "
         f"**{f['Auditor'].nunique()} auditors** between **{f['Date'].min():%d %b}** and **{f['Date'].max():%d %b %Y}** "
         f"({f['Date'].nunique()} working days, about {n / f['Date'].nunique():.0f} visits/day).",
@@ -707,7 +727,7 @@ with tabs[7]:
 # TAB 9 - DATA & DOWNLOAD
 # ----------------------------------------------------------------------------
 with tabs[8]:
-    out_cols = ["GPS Status", "Distance (m)", "City", "Auditor", "Store ID", "Store Name", "Channel", "Lat", "Long",
+    out_cols = ["Panel", "GPS Status", "Distance (m)", "City", "Auditor", "Store ID", "Store Name", "Channel", "Lat", "Long",
                 "Master Lat", "Master Long", "Master Store Name", "Master City", "Master Channel", "Master Auditor",
                 "Auditor Mismatch", "City Mismatch", "Channel Mismatch", "Duplicate GPS", "Start Dist (m)",
                 "GPS Accuracy (m)", "Device ID", "Date", "Start Time", "End Time", "Duration (min)", "Shop Status",

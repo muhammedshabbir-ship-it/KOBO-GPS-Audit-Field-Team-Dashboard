@@ -9,6 +9,7 @@ GPS rule  (distance between master LAT/LONG and KOBO GPS)
     50 - 150 m    -> Review  (pink)
     > 150 m       -> Mismatch(red)
 """
+import hashlib
 import io
 import os
 import tempfile
@@ -164,8 +165,28 @@ def _read_xlsb(path, sheet, wanted):
     return pd.DataFrame(data, columns=list(pick.values()))
 
 
+CACHE_DIR = BASE_DIR / ".cache"
+
+
 @st.cache_data(show_spinner=False)
 def load_kobo(file_bytes: bytes, filename: str) -> pd.DataFrame:
+    # parsed result is stored on disk, so the same file opens instantly next time
+    key = hashlib.sha1(file_bytes).hexdigest()
+    cache_file = CACHE_DIR / f"{key}.pkl"
+    if cache_file.exists():
+        return pd.read_pickle(cache_file)
+    df = _parse_kobo(file_bytes, filename)
+    try:
+        CACHE_DIR.mkdir(exist_ok=True)
+        for old in CACHE_DIR.glob("*.pkl"):
+            old.unlink()
+        df.to_pickle(cache_file)
+    except Exception:
+        pass
+    return df
+
+
+def _parse_kobo(file_bytes: bytes, filename: str) -> pd.DataFrame:
     wanted = set(KEY_COLS) | set(EXTRA_COLS)
     ext = filename.lower().rsplit(".", 1)[-1]
     if ext == "xlsb":
@@ -249,6 +270,7 @@ def process(kobo: pd.DataFrame, master: pd.DataFrame) -> pd.DataFrame:
 # ----------------------------------------------------------------------------
 # EXCEL EXPORT (green / pink / red rows)
 # ----------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
 def to_colored_excel(df: pd.DataFrame) -> bytes:
     from openpyxl.styles import PatternFill
 
@@ -275,7 +297,11 @@ def to_colored_excel(df: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 
+STYLE_ROWS = 600   # coloured preview rows; the full coloured data is in the Excel download
+
+
 def style_status(df, col="GPS Status"):
+    df = df.head(STYLE_ROWS)
     cmap = {S_OK: "rgba(34,197,94,.30)", S_REV: "rgba(244,114,182,.38)", S_RED: "rgba(239,68,68,.45)"}
     pd.set_option("styler.render.max_elements", 5_000_000)
     return df.style.apply(lambda r: [f"background-color:{cmap.get(r[col], 'transparent')}"] * len(r), axis=1)
@@ -371,10 +397,9 @@ kpi(k[6], "Avg Interview", f"{f['Duration (min)'].mean():.1f} min", f"{int(f['Fa
 kpi(k[7], "Completed", f"{(f['Shop Status'] == 'Completed Interview').mean() * 100:.1f}%", f"{int((f['Shop Status'] != 'Completed Interview').sum())} closed")
 st.write("")
 
-tabs = st.tabs([
-    "📊 Overview", "📍 GPS Compare", "👥 Team Performance", "📱 Device Audit",
-    "⏱️ Time & Productivity", "🧊 Coolers & MSL", "🗺️ Map", "📝 Summary", "📥 Data & Download",
-])
+NAMES = ["📊 Overview", "📍 GPS Compare", "👥 Team Performance", "📱 Device Audit",
+         "⏱️ Time & Productivity", "🧊 Coolers & MSL", "🗺️ Map", "📝 Summary", "📥 Data & Download"]
+view = st.radio("View", NAMES, horizontal=True, label_visibility="collapsed", key="view")  # only the chosen view is built = faster
 
 # ----------------------------------------------------------------------------
 # helper tables
@@ -393,10 +418,27 @@ aud_day = f.groupby(["Auditor", "Date"]).agg(
 ).reset_index()
 aud_day["Hours"] = ((aud_day["Last"] - aud_day["First"]).dt.total_seconds() / 3600).clip(upper=16)
 
+ad = f.groupby("Auditor").agg(
+    Devices=("Device ID", "nunique"),
+    Device_List=("Device", lambda x: ", ".join(sorted(x.unique()))),
+    Visits=("Store ID", "size"),
+).reset_index()
+ad["Result"] = np.where(ad["Devices"] > 1, "⚠️ Multiple devices", "✅ One device")
+da = f.groupby("Device").agg(
+    Auditors=("Auditor", "nunique"),
+    Auditor_List=("Auditor", lambda x: ", ".join(sorted(x.unique()))),
+    Visits=("Store ID", "size"),
+    First_Seen=("Date", "min"),
+    Last_Seen=("Date", "max"),
+).reset_index()
+da["Result"] = np.where(da["Auditors"] > 1, "⚠️ Shared device", "✅ One auditor")
+da["First_Seen"], da["Last_Seen"] = da["First_Seen"].dt.date, da["Last_Seen"].dt.date
+
+
 # ----------------------------------------------------------------------------
 # TAB 1 - OVERVIEW
 # ----------------------------------------------------------------------------
-with tabs[0]:
+if view == NAMES[0]:
     c1, c2 = st.columns([1, 2])
     with c1:
         pie_df = cnt.reindex(ORDER).dropna().rename_axis("GPS Status").reset_index(name="Visits")
@@ -433,7 +475,7 @@ with tabs[0]:
 # ----------------------------------------------------------------------------
 # TAB 2 - GPS COMPARE
 # ----------------------------------------------------------------------------
-with tabs[1]:
+if view == NAMES[1]:
     st.markdown(
         '<div class="note">Distance = straight-line (haversine) distance between the <b>master LAT/LONG</b> and the '
         '<b>KOBO “1.7 GPS Coordinates”</b> of the same Store ID. '
@@ -482,7 +524,7 @@ with tabs[1]:
 # ----------------------------------------------------------------------------
 # TAB 3 - TEAM PERFORMANCE
 # ----------------------------------------------------------------------------
-with tabs[2]:
+if view == NAMES[2]:
     perf = f.groupby("Auditor").agg(
         City=("City", lambda x: ", ".join(sorted(x.dropna().unique()))),
         Visits=("Store ID", "size"),
@@ -518,26 +560,10 @@ with tabs[2]:
 # ----------------------------------------------------------------------------
 # TAB 4 - DEVICE AUDIT
 # ----------------------------------------------------------------------------
-with tabs[3]:
+if view == NAMES[3]:
     st.markdown('<div class="note">Rule checked: <b>one auditor should use only one device</b>, and one device '
                 'should belong to only one auditor.</div>', unsafe_allow_html=True)
     st.write("")
-    ad = f.groupby("Auditor").agg(
-        Devices=("Device ID", "nunique"),
-        Device_List=("Device", lambda x: ", ".join(sorted(x.unique()))),
-        Visits=("Store ID", "size"),
-    ).reset_index()
-    ad["Result"] = np.where(ad["Devices"] > 1, "⚠️ Multiple devices", "✅ One device")
-    da = f.groupby("Device").agg(
-        Auditors=("Auditor", "nunique"),
-        Auditor_List=("Auditor", lambda x: ", ".join(sorted(x.unique()))),
-        Visits=("Store ID", "size"),
-        First_Seen=("Date", "min"),
-        Last_Seen=("Date", "max"),
-    ).reset_index()
-    da["Result"] = np.where(da["Auditors"] > 1, "⚠️ Shared device", "✅ One auditor")
-    da["First_Seen"], da["Last_Seen"] = da["First_Seen"].dt.date, da["Last_Seen"].dt.date
-
     d1, d2, d3, d4 = st.columns(4)
     kpi(d1, "Auditors", len(ad))
     kpi(d2, "Devices", len(da))
@@ -567,7 +593,7 @@ with tabs[3]:
 # ----------------------------------------------------------------------------
 # TAB 5 - TIME & PRODUCTIVITY
 # ----------------------------------------------------------------------------
-with tabs[4]:
+if view == NAMES[4]:
     c1, c2 = st.columns(2)
     with c1:
         hr = f.groupby("Hour").size().reset_index(name="Visits")
@@ -599,7 +625,7 @@ with tabs[4]:
 # ----------------------------------------------------------------------------
 # TAB 6 - COOLERS & MSL
 # ----------------------------------------------------------------------------
-with tabs[5]:
+if view == NAMES[5]:
     done = f[f["Shop Status"] == "Completed Interview"]
     c1, c2, c3, c4 = st.columns(4)
     kpi(c1, "Stores with PEP cooler", f"{(done['PEP Coolers'] > 0).mean() * 100:.1f}%", f"{int((done['PEP Coolers'] > 0).sum())} stores")
@@ -637,7 +663,7 @@ with tabs[5]:
 # ----------------------------------------------------------------------------
 # TAB 7 - MAP
 # ----------------------------------------------------------------------------
-with tabs[6]:
+if view == NAMES[6]:
     mp = f[f["Lat"].between(20, 40) & f["Long"].between(60, 80)].copy()
     mp["Distance (m)"] = mp["Distance (m)"].round(1)
     kw = dict(lat="Lat", lon="Long", color="GPS Status", color_discrete_map=COLORS,
@@ -664,7 +690,7 @@ with tabs[6]:
 # ----------------------------------------------------------------------------
 # TAB 8 - SUMMARY (auto generated)
 # ----------------------------------------------------------------------------
-with tabs[7]:
+if view == NAMES[7]:
     tc = status_table("City")
     tc_ok = tc[tc["Total"] >= 20]
     worst_city = tc_ok.sort_values("% Mismatch", ascending=False).iloc[0]
@@ -726,7 +752,7 @@ with tabs[7]:
 # ----------------------------------------------------------------------------
 # TAB 9 - DATA & DOWNLOAD
 # ----------------------------------------------------------------------------
-with tabs[8]:
+if view == NAMES[8]:
     out_cols = ["Panel", "GPS Status", "Distance (m)", "City", "Auditor", "Store ID", "Store Name", "Channel", "Lat", "Long",
                 "Master Lat", "Master Long", "Master Store Name", "Master City", "Master Channel", "Master Auditor",
                 "Auditor Mismatch", "City Mismatch", "Channel Mismatch", "Duplicate GPS", "Start Dist (m)",
@@ -735,12 +761,18 @@ with tabs[8]:
     res = f[out_cols].copy()
     res["Distance (m)"] = res["Distance (m)"].round(1)
     res["Start Dist (m)"] = res["Start Dist (m)"].round(1)
-    st.download_button(
-        "📥 Download coloured Excel (green / pink / red)",
-        data=to_colored_excel(res),
-        file_name="GPS_compare_result.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    # the coloured Excel is only built when asked (keeps the dashboard fast)
+    if st.button("⚙️ Prepare coloured Excel (green / pink / red)"):
+        with st.spinner("Building Excel…"):
+            st.session_state["xlsx"] = to_colored_excel(res)
+    if "xlsx" in st.session_state:
+        st.download_button(
+            "📥 Download coloured Excel",
+            data=st.session_state["xlsx"],
+            file_name="GPS_compare_result.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    st.caption(f"Preview shows the first {STYLE_ROWS} rows - the Excel contains all {len(res):,} rows.")
     show_df(style_status(res.assign(Date=res["Date"].dt.date, **{"Start Time": res["Start Time"].dt.strftime("%d-%b %H:%M"),
                                                                 "End Time": res["End Time"].dt.strftime("%d-%b %H:%M")})),
             hide_index=True, height=560)

@@ -137,13 +137,49 @@ def kpi(col, label, value, sub="", color="#e8eefc"):
 
 
 # ----------------------------------------------------------------------------
+# COLUMN-NAME HELPERS
+# ----------------------------------------------------------------------------
+def _norm(s) -> str:
+    """Normalise a header: collapse spaces/line breaks and upper-case it."""
+    return " ".join(str(s).replace("\n", " ").replace("\r", " ").split()).upper()
+
+
+# normalised versions of the master column names (so 'LAT ' or 'lat' still match)
+MASTER_KEY_NORM = {_norm(k): v for k, v in MASTER_COLS.items()}
+
+
+def _find_header_row(raw: pd.DataFrame) -> int:
+    """Return the row index that contains the master header (default 0)."""
+    for i in range(min(len(raw), 30)):
+        vals = {_norm(x) for x in raw.iloc[i].tolist() if pd.notna(x)}
+        if "REPORTED STORE ID" in vals:
+            return i
+    return 0
+
+
+# ----------------------------------------------------------------------------
 # DATA LOADING
 # ----------------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def load_master(file_bytes: bytes) -> pd.DataFrame:
-    m = pd.read_excel(io.BytesIO(file_bytes))
-    m = m.rename(columns=MASTER_COLS)[list(MASTER_COLS.values())]
+    raw = pd.read_excel(io.BytesIO(file_bytes), header=None)
+    h = _find_header_row(raw)
+
+    m = raw.iloc[h + 1:].copy()
+    m.columns = [_norm(c) for c in raw.iloc[h]]
+    m = m.loc[:, ~pd.Index(m.columns).duplicated()]   # drop duplicate header names
+
+    missing = [k for k in MASTER_KEY_NORM if k not in m.columns]
+    if missing:
+        found = ", ".join(c for c in m.columns if c and c != "NAN")
+        raise ValueError(
+            f"Master file is missing column(s): {', '.join(missing)}. "
+            f"Columns found in the file: {found}"
+        )
+
+    m = m[list(MASTER_KEY_NORM)].rename(columns=MASTER_KEY_NORM)
     m["Store ID"] = m["Store ID"].astype(str).str.strip().str.upper()
+    m = m[m["Store ID"].ne("") & m["Store ID"].ne("NAN")]
     return m.drop_duplicates("Store ID")
 
 
@@ -212,6 +248,13 @@ def haversine_m(lat1, lon1, lat2, lon2):
 
 @st.cache_data(show_spinner=False)
 def process(kobo: pd.DataFrame, master: pd.DataFrame) -> pd.DataFrame:
+    missing = [c for c in KEY_COLS if c not in kobo.columns]
+    if missing:
+        raise ValueError(
+            f"KOBO file is missing column(s): {', '.join(missing)}. "
+            f"Columns found: {', '.join(map(str, kobo.columns))}"
+        )
+
     d = kobo.rename(columns={**KEY_COLS, **EXTRA_COLS}).copy()
     d["Store ID"] = d["Store ID"].astype(str).str.strip().str.upper()
     # PANEL: Store ID starting with BOT -> BOT panel, everything else -> SNAPP panel
@@ -341,12 +384,22 @@ if up_kobo is None and not default_path:
     st.stop()
 
 with st.spinner("Reading files… (a large .xlsb can take a minute the first time)"):
-    master = load_master(MASTER_PATH.read_bytes())
-    if up_kobo is not None:
-        kobo = load_kobo(up_kobo.getvalue(), up_kobo.name)
-    else:
-        kobo = load_kobo(Path(default_path).read_bytes(), default_path)
-    data = process(kobo, master)
+    try:
+        master = load_master(MASTER_PATH.read_bytes())
+    except Exception as e:
+        st.error(f"❌ Could not read the master file. {e}")
+        st.info("Check the column names in the master file, or upload a corrected master above.")
+        st.stop()
+
+    try:
+        if up_kobo is not None:
+            kobo = load_kobo(up_kobo.getvalue(), up_kobo.name)
+        else:
+            kobo = load_kobo(Path(default_path).read_bytes(), default_path)
+        data = process(kobo, master)
+    except Exception as e:
+        st.error(f"❌ Could not read the KOBO file. {e}")
+        st.stop()
 
 # ----------------------------------------------------------------------------
 # FILTERS (top)
